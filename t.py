@@ -1,8 +1,10 @@
 import os
 import re
+import threading
 from datetime import datetime, timezone, timedelta
 import pandas as pd
 import requests
+from flask import Flask
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InputMediaPhoto
 from telegram.ext import (
     ApplicationBuilder,
@@ -47,7 +49,6 @@ def fetch_all_from_airtable():
     except Exception as e:
         print(f"⚠️ ไม่สามารถดึงข้อมูลจาก Airtable ได้: {e}")
     
-    # หากดึงไม่ได้ ให้คืนค่า DataFrame เปล่า
     return pd.DataFrame(columns=["วันเวลา", "ชื่อ", "ที่อยู่", "เบอร์โทร", "เลขผู้เสียภาษี", "หมายเหตุ", "รูปถ่าย"])
 
 def append_to_airtable(row_data):
@@ -329,7 +330,6 @@ async def save_customer_to_airtable_process(update: Update, context: ContextType
     # 🚀 บันทึกตรงขึ้น Airtable ทันที
     success, err_msg = append_to_airtable(new_row)
     
-    # ดึงจำนวนรายการล่าสุดจาก Airtable มาแสดงผล
     df_updated = fetch_all_from_airtable()
     total_records = len(df_updated)
 
@@ -360,9 +360,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ ยกเลิกการบันทึกข้อมูลเรียบร้อยแล้ว สามารถเริ่มใหม่ได้ทันที", reply_markup=main_menu_markup)
     return ConversationHandler.END
 
-# ---------------------------------------------------------
-# ฟังก์ชันแสดงรายชื่อทั้งหมดจาก Airtable โดยตรง
-# ---------------------------------------------------------
 async def show_all_customers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         df = fetch_all_from_airtable()
@@ -400,9 +397,6 @@ async def show_all_customers(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception as e:
         await update.message.reply_text(f"⚠️ เกิดข้อผิดพลาด: {str(e)}", reply_markup=main_menu_markup)
 
-# ---------------------------------------------------------
-# ฟังก์ชันดาวน์โหลดไฟล์ Excel จาก Airtable โดยตรง
-# ---------------------------------------------------------
 async def export_excel_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         df = fetch_all_from_airtable()
@@ -426,9 +420,6 @@ async def export_excel_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"⚠️ เกิดข้อผิดพลาดในการสร้างไฟล์ Excel: {str(e)}", reply_markup=main_menu_markup)
 
-# ---------------------------------------------------------
-# ระบบค้นหาข้อมูลลูกค้าจาก Airtable โดยตรง
-# ---------------------------------------------------------
 async def search_excel_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query_text = update.message.text.strip()
     
@@ -507,7 +498,23 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=main_menu_markup
     )
 
+# ---------------------------------------------------------
+# ระบบ Flask Web Server จำลองสำหรับ Render Web Service
+# ---------------------------------------------------------
+web_app = Flask('')
+
+@web_app.route('/')
+def home():
+    return "Telegram Bot is running 24/7 successfully!"
+
+def run_web():
+    port = int(os.environ.get("PORT", 8080))
+    web_app.run(host='0.0.0.0', port=port)
+
 if __name__ == "__main__":
+    # รัน Web Server บน Thread แยก เพื่อป้องกัน Port Scan Timeout บน Render
+    threading.Thread(target=run_web, daemon=True).start()
+    
     TOKEN = "8833667054:AAFz7v2VA7SSR1QzqK2J9EQFPiMpN8WeL4w"
     
     request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
@@ -537,5 +544,5 @@ if __name__ == "__main__":
     app.add_handler(conv_handler)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_excel_data))
     
-    print("🤖 Telegram Bot เชื่อมต่อ Airtable 100% พร้อมทำงานแล้ว...")
+    print("🤖 Telegram Bot พร้อมเว็บเซิร์ฟเวอร์จำลองเชื่อมต่อ Airtable 100% ทำงานแล้ว...")
     app.run_polling()
