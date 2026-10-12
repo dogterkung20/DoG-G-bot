@@ -16,12 +16,26 @@ from telegram.ext import (
 )
 from telegram.request import HTTPXRequest
 
+# โหลดค่าจากไฟล์ .env (กรณีรันบนคอมพิวเตอร์ตัวเอง)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 # ---------------------------------------------------------
-# 🔑 ตั้งค่า Airtable (ฐานข้อมูลหลัก 100%)
+# 🔑 ดึงค่าความลับจาก Environment Variables (ปลอดภัย 100%)
 # ---------------------------------------------------------
-AIRTABLE_TOKEN = "patQIWF6UL6PXfUC2.8436159311bbebca04f2471c9811a4d18ab89b0713b3a42b42bf17858ecfbc41".strip()
-BASE_ID = "appTpva126RduuRno".strip()  
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+AIRTABLE_TOKEN = os.environ.get("AIRTABLE_TOKEN")
+BASE_ID = os.environ.get("AIRTABLE_BASE_ID")
 TABLE_NAME = "Customers"
+
+# ตรวจสอบความถูกต้องของ Environment Variables
+if not TELEGRAM_BOT_TOKEN:
+    raise ValueError("❌ ไม่พบ TELEGRAM_BOT_TOKEN ใน Environment Variables!")
+if not AIRTABLE_TOKEN or not BASE_ID:
+    raise ValueError("❌ ไม่พบ AIRTABLE_TOKEN หรือ AIRTABLE_BASE_ID ใน Environment Variables!")
 
 def fetch_all_from_airtable():
     """ดึงข้อมูลทั้งหมดจาก Airtable โดยตรง เพื่อใช้เช็กซ้ำและแสดงผล"""
@@ -515,10 +529,8 @@ if __name__ == "__main__":
     # รัน Web Server บน Thread แยก เพื่อป้องกัน Port Scan Timeout บน Render
     threading.Thread(target=run_web, daemon=True).start()
     
-    TOKEN = "8833667054:AAGKg3jMULFB3nE41275yphBulgDCTFCw8Q"
-    
     request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
-    app = ApplicationBuilder().token(TOKEN).request(request).build()
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).request(request).build()
     
     conv_handler = ConversationHandler(
         entry_points=[
