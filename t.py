@@ -515,7 +515,7 @@ if __name__ == "__main__":
     # รัน Web Server บน Thread แยก เพื่อป้องกัน Port Scan Timeout บน Render
     threading.Thread(target=run_web, daemon=True).start()
     
-    TOKEN = "8833667054:AAFz7v2VA7SSR1QzqK2J9EQFPiMpN8WeL4w"
+    TOKEN = "8833667054:AAGKg3jMULFB3nE41275yphBulgDCTFCw8Q"
     
     request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
     app = ApplicationBuilder().token(TOKEN).request(request).build()
