@@ -3,3 +3,4 @@ pandas
 requests
 openpyxl
 flask
+python-dotenv
