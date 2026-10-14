@@ -1,560 +1,793 @@
 import os
 import re
+import json
 import threading
-from datetime import datetime, timezone, timedelta
-import pandas as pd
-import requests
+from datetime import datetime, timedelta
+import openpyxl
 from flask import Flask
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InputMediaPhoto
+from PIL import Image, ImageChops
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
     CommandHandler,
     MessageHandler,
     ConversationHandler,
+    CallbackQueryHandler,
     filters,
 )
 from telegram.request import HTTPXRequest
 
-# โหลดค่าจากไฟล์ .env (กรณีรันบนคอมพิวเตอร์ตัวเอง)
+# ==========================================
+# 🔑 Token บอท Telegram
+# ==========================================
+TELEGRAM_BOT_TOKEN = "8863260350:AAECdIo15nDl0kxPR6tCnBys9opMExapTY4"
+DB_FILE = "local_database.json"
+
+def init_db():
+    if not os.path.exists(DB_FILE):
+        data = {"customers": [], "documents": [], "last_doc_number": "WN-P56-52"}
+        with open(DB_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+
+def load_db():
+    init_db()
+    with open(DB_FILE, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+def save_db(data):
+    with open(DB_FILE, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
+
+def save_or_update_customer(cust_data):
+    db = load_db()
+    customers = db.get("customers", [])
+    existing_index = -1
+    for idx, c in enumerate(customers):
+        if (c.get("customer_name") and c.get("customer_name").strip() == cust_data.get("customer_name", "").strip()) or \
+           (c.get("tax_id") and c.get("tax_id") != "-" and c.get("tax_id") == cust_data.get("tax_id")):
+            existing_index = idx
+            break
+
+    if existing_index >= 0:
+        customers[existing_index].update(cust_data)
+    else:
+        customers.append(cust_data)
+
+    db["customers"] = customers
+    save_db(db)
+
+def get_next_doc_number():
+    db = load_db()
+    last_num = db.get("last_doc_number", "WN-P56-52")
+    match = re.search(r'(\d+)$', last_num)
+    if match:
+        next_val = int(match.group(1)) + 1
+        prefix = last_num[:match.start()]
+        new_num = f"{prefix}{next_val:02d}"
+    else:
+        new_num = "WN-P56-53"
+    db["last_doc_number"] = new_num
+    save_db(db)
+    return new_num
+
+def get_thai_dates():
+    now = datetime.now()
+    thai_year = now.year + 543
+    date_str = f"{now.day:02d}/{now.month:02d}/{thai_year}"
+    due_date = now + timedelta(days=7)
+    due_thai_year = due_date.year + 543
+    due_date_str = f"{due_date.day:02d}/{due_date.month:02d}/{due_thai_year}"
+    return date_str, due_date_str, now.strftime("%Y-%m-%d")
+
+# --- PyMuPDF: ใช้ตัดขอบขาวของ PDF และแปลงเป็น PNG ---
 try:
-    from dotenv import load_dotenv
-    load_dotenv()
+    import fitz  # PyMuPDF
 except ImportError:
-    pass
-
-# ---------------------------------------------------------
-# 🔑 ดึงค่าความลับจาก Environment Variables (ปลอดภัย 100%)
-# ---------------------------------------------------------
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-AIRTABLE_TOKEN = os.environ.get("AIRTABLE_TOKEN")
-BASE_ID = os.environ.get("AIRTABLE_BASE_ID")
-TABLE_NAME = "Customers"
-
-# ตรวจสอบความถูกต้องของ Environment Variables
-if not TELEGRAM_BOT_TOKEN:
-    raise ValueError("❌ ไม่พบ TELEGRAM_BOT_TOKEN ใน Environment Variables!")
-if not AIRTABLE_TOKEN or not BASE_ID:
-    raise ValueError("❌ ไม่พบ AIRTABLE_TOKEN หรือ AIRTABLE_BASE_ID ใน Environment Variables!")
-
-def fetch_all_from_airtable():
-    """ดึงข้อมูลทั้งหมดจาก Airtable โดยตรง เพื่อใช้เช็กซ้ำและแสดงผล"""
     try:
-        url = f"https://api.airtable.com/v0/{BASE_ID}/{TABLE_NAME}"
-        auth_header = f"Bearer {AIRTABLE_TOKEN}".encode('utf-8').decode('latin-1')
-        headers = {"Authorization": auth_header}
-        
-        response = requests.get(url, headers=headers, timeout=30)
-        if response.status_code == 200:
-            records = response.json().get("records", [])
-            rows = []
-            for record in records:
-                fields = record.get("fields", {})
-                rows.append({
-                    "วันเวลา": fields.get("วันเวลา", "-"),
-                    "ชื่อ": fields.get("ชื่อ", "-"),
-                    "ที่อยู่": fields.get("ที่อยู่", "-"),
-                    "เบอร์โทร": fields.get("เบอร์โทร", "-"),
-                    "เลขผู้เสียภาษี": fields.get("เลขผู้เสียภาษี", "-"),
-                    "หมายเหตุ": fields.get("หมายเหตุ", "-"),
-                    "รูปถ่าย": fields.get("รูปถ่าย", "-")
-                })
-            return pd.DataFrame(rows)
-    except Exception as e:
-        print(f"⚠️ ไม่สามารถดึงข้อมูลจาก Airtable ได้: {e}")
-    
-    return pd.DataFrame(columns=["วันเวลา", "ชื่อ", "ที่อยู่", "เบอร์โทร", "เลขผู้เสียภาษี", "หมายเหตุ", "รูปถ่าย"])
+        import pymupdf as fitz
+    except ImportError:
+        fitz = None
 
-def append_to_airtable(row_data):
-    """ส่งข้อมูลบันทึกตรงขึ้น Airtable ทันที"""
-    try:
-        url = f"https://api.airtable.com/v0/{BASE_ID}/{TABLE_NAME}"
-        auth_header = f"Bearer {AIRTABLE_TOKEN}".encode('utf-8').decode('latin-1')
-        
-        headers = {
-            "Authorization": auth_header,
-            "Content-Type": "application/json; charset=utf-8"
-        }
-        
-        payload = {
-            "fields": {
-                "วันเวลา": str(row_data["วันเวลา"]),
-                "ชื่อ": str(row_data["ชื่อ"]),
-                "ที่อยู่": str(row_data["ที่อยู่"]),
-                "เบอร์โทร": str(row_data["เบอร์โทร"]),
-                "เลขผู้เสียภาษี": str(row_data["เลขผู้เสียภาษี"]),
-                "หมายเหตุ": str(row_data["หมายเหตุ"]),
-                "รูปถ่าย": str(row_data["รูปถ่าย"])
-            }
-        }
-        
-        response = requests.post(url, json=payload, headers=headers, timeout=30)
-        
-        if response.status_code in [200, 201]:
-            print("✅ บันทึกข้อมูลขึ้น Airtable สำเร็จเรียบร้อย!")
-            return True, "Success"
+A4_WIDTH_PT = 595.276
+CONVERT_ERRORS = {}
+
+def find_content_bbox_px(pil_image, white_threshold=245):
+    mask = pil_image.convert("L").point(lambda p: 255 if p < white_threshold else 0)
+    return mask.getbbox()
+
+def make_borderless_pdf_and_png(raw_pdf, final_pdf, final_png, png_dpi=200):
+    if fitz is not None:
+        src = fitz.open(raw_pdf)
+        page = src[0]
+
+        probe_dpi = 200
+        pix = page.get_pixmap(dpi=probe_dpi, alpha=False)
+        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        bbox = find_content_bbox_px(img)
+
+        if bbox:
+            k = 72.0 / probe_dpi
+            inset = 0.4
+            clip = fitz.Rect(bbox[0] * k + inset, bbox[1] * k + inset,
+                             bbox[2] * k - inset, bbox[3] * k - inset) & page.rect
         else:
-            print(f"⚠️ Airtable Error ({response.status_code}): {response.text}")
-            return False, f"Airtable Error ({response.status_code}): {response.text}"
-            
+            clip = page.rect
+
+        out = fitz.open()
+        target_w = A4_WIDTH_PT
+        target_h = target_w * clip.height / clip.width
+        new_page = out.new_page(width=target_w, height=target_h)
+        new_page.show_pdf_page(new_page.rect, src, 0, clip=clip)
+        out.save(final_pdf, garbage=3, deflate=True)
+        out.close()
+        src.close()
+
+        chk = fitz.open(final_pdf)
+        chk[0].get_pixmap(dpi=png_dpi, alpha=False).save(final_png)
+        chk.close()
+        return
+
+    try:
+        from pdf2image import convert_from_path
+    except ImportError:
+        os.replace(raw_pdf, final_pdf)
+        raise RuntimeError("สร้างรูปภาพไม่ได้ ให้ติดตั้ง PyMuPDF ด้วยคำสั่ง: pip install pymupdf")
+
+    os.replace(raw_pdf, final_pdf)
+    pil_img = convert_from_path(final_pdf, dpi=png_dpi)[0].convert("RGB")
+    bbox = find_content_bbox_px(pil_img)
+    if bbox:
+        pil_img = pil_img.crop(bbox)
+    pil_img.save(final_png, "PNG")
+
+
+BOT_VERSION = "v4-borderless-check-fixed"
+CONVERT_STATUS = {}
+
+def status_line(doc_number):
+    s = CONVERT_STATUS.get(doc_number)
+    return f"\n\n🔧 {s}" if s else ""
+
+
+# =========================================================
+# 📸 ฟังก์ชันรับและจัดการรูปภาพที่ผู้ใช้อัปโหลดเข้ามาในแชท
+# =========================================================
+async def handle_photo_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        photo_file = await update.message.photo[-1].get_file()
+        os.makedirs("downloads", exist_ok=True)
+        file_path = f"downloads/photo_{update.message.from_user.id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+        await photo_file.download_to_drive(file_path)
+        await update.message.reply_text("✅ บันทึกรูปภาพเรียบร้อยแล้วครับ!", reply_markup=main_menu_markup)
     except Exception as e:
-        print(f"⚠️ ไม่สามารถเชื่อมต่อ Airtable ได้ : {e}")
-        return False, str(e)
+        print(f"Photo upload error: {e}")
+        await update.message.reply_text("❌ อัปโหลดรูปไม่สำเร็จ กรุณาลองใหม่อีกครั้ง", reply_markup=main_menu_markup)
+
+
+def list_registry_printers():
+    result = []
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                             r"Software\Microsoft\Windows NT\CurrentVersion\Devices")
+        i = 0
+        while True:
+            try:
+                name, data, _ = winreg.EnumValue(key, i)
+            except OSError:
+                break
+            i += 1
+            result.append((name, str(data)))
+    except Exception:
+        pass
+    return result
+
+def find_pdf_printer_name_for_excel():
+    for name, data in list_registry_printers():
+        if "microsoft print to pdf" in name.lower():
+            port = data.split(",")[-1].strip()
+            return f"{name} on {port}"
+    return None
+
+def use_pdf_printer(excel):
+    candidates = []
+    name = find_pdf_printer_name_for_excel()
+    if name:
+        candidates.append(name)
+    candidates += [f"Microsoft Print to PDF on Ne{n:02d}:" for n in range(0, 100)]
+    for cand in candidates:
+        try:
+            excel.ActivePrinter = cand
+            return cand
+        except Exception:
+            continue
+    return None
+
+def diagnose_environment():
+    lines = [f"🔧 เวอร์ชันบอท: {BOT_VERSION}"]
+    lines.append("PyMuPDF: " + ("✅ ติดตั้งแล้ว" if fitz is not None else "❌ ยังไม่ได้ติดตั้ง"))
+    try:
+        import pdf2image  # noqa: F401
+        lines.append("pdf2image: ✅")
+    except ImportError:
+        lines.append("pdf2image: -")
+
+    printers = list_registry_printers()
+    if printers:
+        lines.append("เครื่องพิมพ์ที่เห็น: " + " | ".join(f"{n}" for n, _ in printers))
+    else:
+        lines.append("เครื่องพิมพ์ที่เห็น: (อ่านรายการไม่ได้)")
+    lines.append("พบ Microsoft Print to PDF: " + (find_pdf_printer_name_for_excel() or "❌ ไม่พบ"))
+    return lines
+
+def convert_single_sheet_to_pdf_and_image(excel_filename, target_sheet_name, doc_number):
+    pdf_filename = f"{doc_number}.pdf"
+    image_filename = f"{doc_number}.png"
+    raw_pdf = f"raw_{doc_number}.pdf"
+    pdf_created, img_created = False, False
+    CONVERT_ERRORS.pop(doc_number, None)
+
+    excel = None
+    wb = None
+    used_printer = None
+    try:
+        import win32com.client
+        excel = win32com.client.DispatchEx("Excel.Application")
+        excel.Visible = False
+        excel.DisplayAlerts = False
+
+        abs_excel = os.path.abspath(excel_filename)
+        abs_raw_pdf = os.path.abspath(raw_pdf)
+
+        wb = excel.Workbooks.Open(abs_excel)
+
+        target_ws = None
+        for ws in wb.Worksheets:
+            if ws.Name == target_sheet_name:
+                target_ws = ws
+                break
+
+        if target_ws is None:
+            raise RuntimeError(f"ไม่พบชีทชื่อ '{target_sheet_name}' ในไฟล์ Excel")
+
+        used_printer = use_pdf_printer(excel)
+
+        target_ws.PageSetup.PrintArea = target_ws.UsedRange.Address
+        target_ws.PageSetup.LeftMargin = 0
+        target_ws.PageSetup.RightMargin = 0
+        target_ws.PageSetup.TopMargin = 0
+        target_ws.PageSetup.BottomMargin = 0
+        target_ws.PageSetup.HeaderMargin = 0
+        target_ws.PageSetup.FooterMargin = 0
+        target_ws.PageSetup.Orientation = 1
+        target_ws.PageSetup.PaperSize = 9
+        target_ws.PageSetup.Zoom = False
+        target_ws.PageSetup.FitToPagesWide = 1
+        target_ws.PageSetup.FitToPagesTall = 1
+        target_ws.PageSetup.CenterHorizontally = True
+        target_ws.PageSetup.CenterVertically = False
+
+        target_ws.ExportAsFixedFormat(0, abs_raw_pdf)
+        pdf_created = True
+    except Exception as e:
+        print(f"Excel COM PDF Error: {e}")
+        CONVERT_ERRORS[doc_number] = f"ส่งออก PDF จาก Excel ไม่สำเร็จ: {e}"
+    finally:
+        try:
+            if wb is not None:
+                wb.Close(False)
+        except Exception:
+            pass
+        try:
+            if excel is not None:
+                excel.Quit()
+        except Exception:
+            pass
+
+    CONVERT_STATUS[doc_number] = f"{BOT_VERSION} | เครื่องพิมพ์: {used_printer or 'สลับเป็น PDF ไม่สำเร็จ'}"
+
+    if pdf_created and os.path.exists(raw_pdf):
+        try:
+            make_borderless_pdf_and_png(raw_pdf, pdf_filename, image_filename)
+            img_created = os.path.exists(image_filename)
+        except Exception as e:
+            print(f"Borderless/PNG Error: {e}")
+            CONVERT_ERRORS[doc_number] = f"ตัดขอบ/สร้างรูปภาพไม่สำเร็จ: {e}"
+            if not os.path.exists(pdf_filename):
+                try:
+                    os.replace(raw_pdf, pdf_filename)
+                except Exception:
+                    pass
+        finally:
+            if os.path.exists(raw_pdf):
+                try:
+                    os.remove(raw_pdf)
+                except Exception:
+                    pass
+
+    pdf_ok = os.path.exists(pdf_filename)
+    return (pdf_filename if pdf_ok else None), (image_filename if img_created else None)
 
 # ---------------------------------------------------------
-# สถานะการสนทนาและปุ่มเมนู
+# เมนูหลัก
 # ---------------------------------------------------------
-NAME, ADDRESS, PHONE, TAX_ID, REMARKS, PHOTOS = range(6)
-MONTHS_TH = ["ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.", "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."]
-
 main_menu_markup = ReplyKeyboardMarkup(
     [
-        ["➕ บันทึกข้อมูลลูกค้า", "📋 แสดงรายชื่อทั้งหมด"],
-        ["📁 โหลดไฟล์ Excel ทั้งหมด", "📖 คู่มือการใช้งาน"]
+        ["📄 ออกใบเสนอราคา", "📑 ออกอินวอย (Invoice)"],
+        ["🧾 ออกใบเสร็จรับเงิน", "📋 รายชื่อลูกค้าที่บันทึกไว้"],
+        ["📖 คู่มือการใช้งาน"]
     ],
     resize_keyboard=True
 )
 
-def get_thai_datetime_str():
-    tz_th = timezone(timedelta(hours=7))
-    now_th = datetime.now(tz_th)
-    day = now_th.day
-    month = MONTHS_TH[now_th.month - 1]
-    full_year = now_th.year + 543
-    time_str = now_th.strftime("%H:%M")
-    return f"{day} {month} {full_year} เวลา {time_str} น."
+# =========================================================
+# 1. ออกใบเสนอราคา (Quotation)
+# =========================================================
+QUOT_FORM, INPUT_FIELD = range(2)
 
-async def upload_image_to_cloud(photo_file):
-    """อัปโหลดรูปขึ้น Catbox และลบทิ้งจากเครื่องทันที"""
-    temp_filename = f"temp_{int(datetime.now().timestamp())}.jpg"
-    try:
-        await photo_file.download_to_drive(temp_filename)
-        url = "https://catbox.moe/user/api.php"
-        with open(temp_filename, 'rb') as f:
-            response = requests.post(
-                url,
-                data={"reqtype": "fileupload"},
-                files={"fileToUpload": f},
-                timeout=30
-            )
-        if os.path.exists(temp_filename):
-            os.remove(temp_filename)
-            
-        if response.status_code == 200:
-            image_url = response.text.strip()
-            if image_url.startswith("http"):
-                return image_url
-    except Exception as e:
-        print(f"Upload error: {e}")
-        if os.path.exists(temp_filename):
-            os.remove(temp_filename)
-    return None
+def build_quotation_keyboard(data):
+    keyboard = [
+        [InlineKeyboardButton(f"👤 ชื่อลูกค้า: {data.get('customer_name')}", callback_data="edit_name")],
+        [InlineKeyboardButton(f"📍 ที่อยู่ 1: {data.get('address_line1')}", callback_data="edit_addr1")],
+        [InlineKeyboardButton(f"📍 ที่อยู่ 2: {data.get('address_line2')}", callback_data="edit_addr2")],
+        [
+            InlineKeyboardButton(f"🆔 เลขภาษี: {data.get('tax_id')}", callback_data="edit_tax"),
+            InlineKeyboardButton(f"📞 โทร: {data.get('phone')}", callback_data="edit_phone")
+        ],
+        [InlineKeyboardButton(f"📦 สินค้า: {data.get('item_name')}", callback_data="edit_item")],
+        [
+            InlineKeyboardButton(f"🔢 จำนวน: {data.get('qty'):,.0f}", callback_data="edit_qty"),
+            InlineKeyboardButton(f"💰 ราคา/หน่วย: {data.get('price_per_unit'):,.2f}", callback_data="edit_price")
+        ],
+        [InlineKeyboardButton(f"📝 หมายเหตุ: {data.get('remarks')}", callback_data="edit_remarks")],
+        [InlineKeyboardButton("🚀 สร้างใบเสนอราคา (เลือกรูปแบบไฟล์)", callback_data="generate_now")],
+        [InlineKeyboardButton("❌ ยกเลิก", callback_data="cancel_menu")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
-# ---------------------------------------------------------
-# ระบบบันทึกข้อมูลลูกค้า
-# ---------------------------------------------------------
-async def start_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['new_customer'] = {}
-    context.user_data['photo_urls'] = []
-    
-    cancel_markup = ReplyKeyboardMarkup([["❌ ยกเลิก"]], resize_keyboard=True, one_time_keyboard=True)
+async def start_quotation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['quot_data'] = {
+        'customer_name': 'บริษัท คลีน แอนด์ แคร์ พูล เซอร์วิส จำกัด',
+        'address_line1': '162/101 หมู่ที่ 9 ตำบลสวนหลวง',
+        'address_line2': 'อำเภอกระทุ่มแบน จังหวัดสมุทรสาคร 74110',
+        'tax_id': '0745564002745',
+        'phone': '0891351884',
+        'item_name': 'เตียงผู้ป่วย 3 ไกร์ระบบมือหมุน',
+        'qty': 30.0,
+        'price_per_unit': 18300.0,
+        'remarks': '-'
+    }
     await update.message.reply_text(
-        "📝 **เริ่มกระบวนการบันทึกข้อมูลลูกค้าใหม่**\n\n"
-        "1️⃣ กรุณาพิมพ์ **'ชื่อ-นามสกุล'** ของลูกค้าครับ:",
-        reply_markup=cancel_markup
+        "📄 **ระบบออกใบเสนอราคา (ไร้ขอบขาว)**\nกดปุ่มแก้ไขข้อมูล หรือกดสร้างเอกสารได้เลยครับ:",
+        reply_markup=build_quotation_keyboard(context.user_data['quot_data'])
     )
-    return NAME
+    return QUOT_FORM
 
-async def receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text == "❌ ยกเลิก":
-        return await cancel(update, context)
-        
-    context.user_data['new_customer']['name'] = text
-    cancel_markup = ReplyKeyboardMarkup([["❌ ยกเลิก"]], resize_keyboard=True, one_time_keyboard=True)
-    
-    await update.message.reply_text(
-        f"🟢 **ข้อมูลปัจจุบันที่บันทึก:**\n"
-        f"👤 ชื่อ: {text}\n\n"
-        "2️⃣ กรุณาพิมพ์ **'ที่อยู่'** ของลูกค้าต่อครับ:",
-        reply_markup=cancel_markup
-    )
-    return ADDRESS
+async def handle_quotation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    action = query.data
 
-async def receive_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text == "❌ ยกเลิก":
-        return await cancel(update, context)
-        
-    context.user_data['new_customer']['address'] = text
-    data = context.user_data['new_customer']
-    cancel_markup = ReplyKeyboardMarkup([["❌ ยกเลิก"]], resize_keyboard=True, one_time_keyboard=True)
-    
-    await update.message.reply_text(
-        f"🟢 **ข้อมูลปัจจุบันที่บันทึก:**\n"
-        f"👤 ชื่อ: {data.get('name')}\n"
-        f"📍 ที่อยู่: {text}\n\n"
-        "3️⃣ กรุณาพิมพ์ **'เบอร์โทรศัพท์'** ของลูกค้าครับ:",
-        reply_markup=cancel_markup
-    )
-    return PHONE
-
-async def receive_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text == "❌ ยกเลิก":
-        return await cancel(update, context)
-        
-    context.user_data['new_customer']['phone'] = text
-    data = context.user_data['new_customer']
-    cancel_markup = ReplyKeyboardMarkup([["❌ ยกเลิก"]], resize_keyboard=True, one_time_keyboard=True)
-    
-    await update.message.reply_text(
-        f"🟢 **ข้อมูลปัจจุบันที่บันทึก:**\n"
-        f"👤 ชื่อ: {data.get('name')}\n"
-        f"📍 ที่อยู่: {data.get('address')}\n"
-        f"📞 เบอร์โทร: {text}\n\n"
-        "4️⃣ กรุณาพิมพ์ **'เลขประจำตัวผู้เสียภาษี'** (หากไม่มีพิมพ์ `-`):",
-        reply_markup=cancel_markup
-    )
-    return TAX_ID
-
-async def receive_tax_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text == "❌ ยกเลิก":
-        return await cancel(update, context)
-        
-    context.user_data['new_customer']['tax_id'] = text
-    data = context.user_data['new_customer']
-    cancel_markup = ReplyKeyboardMarkup([["❌ ยกเลิก"]], resize_keyboard=True, one_time_keyboard=True)
-    
-    await update.message.reply_text(
-        f"🟢 **ข้อมูลปัจจุบันที่บันทึก:**\n"
-        f"👤 ชื่อ: {data.get('name')}\n"
-        f"📍 ที่อยู่: {data.get('address')}\n"
-        f"📞 เบอร์โทร: {data.get('phone')}\n"
-        f"🏢 เลขผู้เสียภาษี: {text}\n\n"
-        "5️⃣ กรุณาพิมพ์ **'หมายเหตุ'** (หากไม่มีพิมพ์ `-`):",
-        reply_markup=cancel_markup
-    )
-    return REMARKS
-
-async def receive_remarks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text == "❌ ยกเลิก":
-        return await cancel(update, context)
-        
-    context.user_data['new_customer']['remarks'] = text
-    data = context.user_data['new_customer']
-    
-    reply_keyboard = [["เสร็จสิ้น", "❌ ยกเลิก"]]
-    await update.message.reply_text(
-        f"🟢 **ตรวจสอบข้อมูลภาพรวมก่อนแนบรูป:**\n"
-        f"👤 ชื่อ: {data.get('name')}\n"
-        f"📍 ที่อยู่: {data.get('address')}\n"
-        f"📞 เบอร์โทร: {data.get('phone')}\n"
-        f"🏢 เลขผู้เสียภาษี: {data.get('tax_id')}\n"
-        f"📝 หมายเหตุ: {text}\n\n"
-        "6️⃣ กรุณาส่ง **'รูปถ่ายบัตรประชาชนหรือสำเนาเอกสาร'**\n"
-        "*(ส่งได้สูงสุด 5 รูป)* เมื่อส่งครบให้กดปุ่ม **'เสร็จสิ้น'** ด้านล่าง",
-        reply_markup=ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True, one_time_keyboard=True)
-    )
-    return PHOTOS
-
-async def receive_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text and update.message.text.strip() == "❌ ยกเลิก":
-        return await cancel(update, context)
-
-    photo_urls = context.user_data.setdefault('photo_urls', [])
-    
-    if update.message.text and update.message.text.strip() == "เสร็จสิ้น":
-        return await save_customer_to_airtable_process(update, context)
-
-    if update.message.photo:
-        if len(photo_urls) >= 5:
-            await update.message.reply_text("⚠️ คุณส่งรูปครบ 5 รูปแล้ว กำลังบันทึกข้อมูลลงระบบครับ...")
-            return await save_customer_to_airtable_process(update, context)
-
-        status_msg = await update.message.reply_text("☁️ กำลังอัปโหลดรูปภาพขึ้นคลาวด์...")
-        photo_file = await update.message.photo[-1].get_file()
-        image_url = await upload_image_to_cloud(photo_file)
-        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=status_msg.message_id)
-
-        if image_url:
-            photo_urls.append(image_url)
-            remaining = 5 - len(photo_urls)
-            if remaining > 0:
-                await update.message.reply_text(
-                    f"✅ อัปโหลดรูปที่ {len(photo_urls)} สำเร็จ! (อัปโหลดแล้ว {len(photo_urls)} รูป)\n"
-                    "ส่งรูปถัดไป หรือกดปุ่ม **'เสร็จสิ้น'** เพื่อบันทึกข้อมูล"
-                )
-            else:
-                await update.message.reply_text("✅ ครบ 5 รูปแล้ว กำลังบันทึกข้อมูล...")
-                return await save_customer_to_airtable_process(update, context)
-        else:
-            await update.message.reply_text("❌ อัปโหลดรูปไม่สำเร็จ กรุณาลองใหม่อีกครั้ง")
-        return PHOTOS
-    else:
-        await update.message.reply_text("⚠️ กรุณาส่งเป็นรูปภาพ หรือกดปุ่ม 'เสร็จสิ้น' / '❌ ยกเลิก'")
-        return PHOTOS
-
-async def save_customer_to_airtable_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = context.user_data.get('new_customer', {})
-    photo_urls = context.user_data.get('photo_urls', [])
-    
-    timestamp = get_thai_datetime_str()
-    name = data.get('name', '-')
-    address = data.get('address', '-')
-    phone = data.get('phone', '-')
-    tax_id = data.get('tax_id', '-')
-    remarks = data.get('remarks', '-')
-    
-    # 🔍 เช็กข้อมูลซ้ำโดยดึงข้อมูลสดจาก Airtable โดยตรง
-    df_airtable = fetch_all_from_airtable()
-    duplicate_fields = []
-    if not df_airtable.empty:
-        if name in df_airtable["ชื่อ"].values:
-            duplicate_fields.append("ชื่อ-นามสกุล")
-        if phone in df_airtable["เบอร์โทร"].values:
-            duplicate_fields.append("เบอร์โทรศัพท์")
-        if tax_id != "-" and tax_id in df_airtable["เลขผู้เสียภาษี"].values:
-            duplicate_fields.append("เลขประจำตัวผู้เสียภาษี")
-            
-    if duplicate_fields:
-        dup_str = ", ".join(duplicate_fields)
-        await update.message.reply_text(
-            f"❌ **ไม่สามารถบันทึกได้ เนื่องจากข้อมูลซ้ำในระบบ Airtable!**\n\n"
-            f"⚠️ จุดที่ซ้ำ: **{dup_str}**",
-            reply_markup=main_menu_markup
-        )
-        context.user_data.clear()
+    if action == "cancel_menu":
+        await query.message.edit_text("❌ ยกเลิกรายการแล้ว")
         return ConversationHandler.END
 
-    photos_str = ", ".join(photo_urls) if photo_urls else "-"
+    if action == "generate_now":
+        await query.message.edit_text("⏳ กำลังสร้างไฟล์ PDF และรูปภาพ...")
+        data = context.user_data['quot_data']
+        doc_number = get_next_doc_number()
+        date_str, due_str, date_iso = get_thai_dates()
 
-    new_row = {
-        "วันเวลา": timestamp,
-        "ชื่อ": name,
-        "ที่อยู่": address,
-        "เบอร์โทร": phone,
-        "เลขผู้เสียภาษี": tax_id,
-        "หมายเหตุ": remarks,
-        "รูปถ่าย": photos_str
+        cust_info = {
+            "customer_name": data['customer_name'],
+            "address_line1": data['address_line1'],
+            "address_line2": data['address_line2'],
+            "tax_id": data['tax_id'],
+            "phone": data['phone']
+        }
+        save_or_update_customer(cust_info)
+
+        db = load_db()
+        db["documents"].append({**data, "doc_number": doc_number, "date_iso": date_iso, "type": "quotation"})
+        save_db(db)
+
+        wb = openpyxl.load_workbook("บริษัท วินเนอร์ เชียงราย จำกัด.xlsx")
+        ws = wb['เสนอราคา']
+        ws['C9'] = f"      {data['customer_name']}"
+        ws['C10'] = f"      {data['address_line1']}"
+        ws['C11'] = f"      {data['address_line2']}"
+        ws['B12'] = f"เลขกำกับภาษี    {data['tax_id']}"
+        ws['E12'] = f"เบอร์โทรศัพท์  {data['phone']}"
+        ws['H9'] = doc_number
+        ws['H10'] = date_str
+        ws['H11'] = due_str
+        ws['C21'] = data['item_name']
+        ws['F21'] = data['qty']
+        ws['G21'] = data['price_per_unit']
+        if data['remarks'] != "-":
+            ws['B33'] = f"หมายเหตุ : {data['remarks']}"
+
+        temp_excel = f"temp_{doc_number}.xlsx"
+        wb.save(temp_excel)
+        
+        pdf_file, img_file = convert_single_sheet_to_pdf_and_image(temp_excel, 'เสนอราคา', doc_number)
+        if os.path.exists(temp_excel): os.remove(temp_excel)
+
+        context.bot_data[f"pdf_{doc_number}"] = pdf_file
+        context.bot_data[f"img_{doc_number}"] = img_file
+
+        file_select_keyboard = [
+            [
+                InlineKeyboardButton("📄 รับไฟล์ PDF", callback_data=f"getpdf_{doc_number}"),
+                InlineKeyboardButton("🖼️ รับเป็นรูปภาพ", callback_data=f"getimg_{doc_number}")
+            ]
+        ]
+        await query.message.reply_text(
+            f"✅ **สร้างใบเสนอราคาสำเร็จ!** (เลขที่: `{doc_number}`)\nเลือกรูปแบบไฟล์ที่ต้องการด้านล่าง:{status_line(doc_number)}",
+            reply_markup=InlineKeyboardMarkup(file_select_keyboard)
+        )
+        return ConversationHandler.END
+
+    field_map = {
+        "edit_name": ("customer_name", "กรุณาพิมพ์ชื่อลูกค้า:"),
+        "edit_addr1": ("address_line1", "กรุณาพิมพ์ที่อยู่ บรรทัดที่ 1:"),
+        "edit_addr2": ("address_line2", "กรุณาพิมพ์ที่อยู่ บรรทัดที่ 2:"),
+        "edit_tax": ("tax_id", "กรุณาพิมพ์เลขประจำตัวผู้เสียภาษี:"),
+        "edit_phone": ("phone", "กรุณาพิมพ์เบอร์โทรศัพท์:"),
+        "edit_item": ("item_name", "กรุณาพิมพ์ชื่อรายการสินค้า:"),
+        "edit_qty": ("qty", "กรุณาพิมพ์จำนวนสินค้า:"),
+        "edit_price": ("price_per_unit", "กรุณาพิมพ์ราคาต่อหน่วย:"),
+        "edit_remarks": ("remarks", "กรุณาพิมพ์หมายเหตุ:")
     }
 
-    # 🚀 บันทึกตรงขึ้น Airtable ทันที
-    success, err_msg = append_to_airtable(new_row)
-    
-    df_updated = fetch_all_from_airtable()
-    total_records = len(df_updated)
+    if action in field_map:
+        context.user_data['editing_field'] = field_map[action][0]
+        await query.message.reply_text(field_map[action][1])
+        return INPUT_FIELD
 
-    if success:
-        sync_status = "✅ **บันทึกและซิงก์ขึ้น Airtable สำเร็จเรียบร้อย!**"
-    else:
-        sync_status = f"⚠️ **เกิดข้อผิดพลาดในการบันทึก Airtable:**\n`{err_msg}`"
+    return QUOT_FORM
+
+async def receive_quotation_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    field = context.user_data.get('editing_field')
+    if field:
+        if field in ['qty', 'price_per_unit']:
+            try: context.user_data['quot_data'][field] = float(text)
+            except: pass
+        else:
+            context.user_data['quot_data'][field] = text
 
     await update.message.reply_text(
-        f"🎉 **สถานะการบันทึกข้อมูล:**\n\n"
-        f"{sync_status}\n\n"
-        f"📊 ลำดับที่ใน Airtable: **{total_records}**\n"
-        f"📅 วันเวลา: {timestamp}\n"
-        f"👤 ชื่อ: {name}\n"
-        f"📍 ที่อยู่: {address}\n"
-        f"📞 เบอร์โทร: {phone}\n"
-        f"🏢 เลขผู้เสียภาษี: {tax_id}\n"
-        f"📝 หมายเหตุ: {remarks}\n"
-        f"🔗 แนบรูปลิงก์คลาวด์: {len(photo_urls)} รูป",
-        reply_markup=main_menu_markup
+        "🔄 อัปเดตข้อมูลเรียบร้อยแล้ว:",
+        reply_markup=build_quotation_keyboard(context.user_data['quot_data'])
     )
+    return QUOT_FORM
+
+
+# =========================================================
+# 2. ออกอินวอย (Invoice)
+# =========================================================
+INV_SELECT, INV_VAL = range(2)
+
+async def start_invoice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = load_db()
+    docs = db.get("documents", [])[-5:]
+
+    if not docs:
+        await update.message.reply_text("⚠️ ยังไม่มีประวัติเอกสาร กรุณาออกใบเสนอราคาก่อนครับ", reply_markup=main_menu_markup)
+        return ConversationHandler.END
+
+    keyboard = []
+    for i, doc in enumerate(docs):
+        keyboard.append([InlineKeyboardButton(f"📁 {doc.get('customer_name')} ({doc.get('doc_number')})", callback_data=f"sel_inv_{i}")])
     
-    context.user_data.clear()
-    return ConversationHandler.END
+    context.user_data['available_docs'] = docs
+    await update.message.reply_text(
+        "📑 **ออกอินวอย (Invoice)**\nเลือกรายชื่อจากประวัติเพื่อดึงข้อมูลมาออกอินวอย:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return INV_SELECT
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.message.reply_text("❌ ยกเลิกการบันทึกข้อมูลเรียบร้อยแล้ว สามารถเริ่มใหม่ได้ทันที", reply_markup=main_menu_markup)
-    return ConversationHandler.END
+async def invoice_doc_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    idx = int(query.data.split("_")[-1])
+    doc = context.user_data['available_docs'][idx]
+    context.user_data['inv_data'] = doc
 
-async def show_all_customers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        df = fetch_all_from_airtable()
-        if df.empty:
-            await update.message.reply_text("⚠️ ยังไม่มีข้อมูลรายชื่อใน Airtable ครับ", reply_markup=main_menu_markup)
-            return
+    await query.message.reply_text(
+        f"✅ ดึงข้อมูลของ: **{doc['customer_name']}** เรียบร้อย\n\n"
+        "พิมพ์ยอดชำระ (เช่นพิมพ์ `60` สำหรับ 60% หรือระบุจำนวนเงินบาท เช่น `50000`):"
+    )
+    return INV_VAL
 
-        total_records = len(df)
-        header = f"📋 **รายชื่อลูกค้าทั้งหมดใน Airtable ({total_records} รายการ):**\n\n"
-        messages, current_chunk = [], header
-        
-        for idx, row in df.iterrows():
-            rec_num = idx + 1
-            remark_text = row.get('หมายเหตุ', '-')
-            
-            line = (
-                f"🔹 **ลำดับที่ {rec_num}**: {row['ชื่อ']}\n"
-                f"   📅 บันทึกเมื่อ: {row['วันเวลา']}\n"
-                f"   📝 หมายเหตุ: {remark_text}\n"
-                "----------------------------------------\n"
-            )
-            if len(current_chunk) + len(line) > 3800:
-                messages.append(current_chunk)
-                current_chunk = line
-            else:
-                current_chunk += line
-        
-        if current_chunk:
-            messages.append(current_chunk)
-            
-        for i, msg in enumerate(messages):
-            markup = main_menu_markup if i == len(messages) - 1 else None
-            await update.message.reply_text(msg, reply_markup=markup)
-
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ เกิดข้อผิดพลาด: {str(e)}", reply_markup=main_menu_markup)
-
-async def export_excel_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        df = fetch_all_from_airtable()
-        if df.empty:
-            await update.message.reply_text("⚠️ ยังไม่มีข้อมูลใน Airtable ครับ", reply_markup=main_menu_markup)
-            return
-            
-        export_filename = "customer_database.xlsx"
-        df.to_excel(export_filename, index=False)
-        
-        with open(export_filename, 'rb') as f:
-            await update.message.reply_document(
-                document=f,
-                filename="Customer_Database.xlsx",
-                caption=f"📁 **ไฟล์ Excel ข้อมูลลูกค้าทั้งหมดจาก Airtable** ({len(df)} รายการ)",
-                reply_markup=main_menu_markup
-            )
-        if os.path.exists(export_filename):
-            os.remove(export_filename)
-            
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ เกิดข้อผิดพลาดในการสร้างไฟล์ Excel: {str(e)}", reply_markup=main_menu_markup)
-
-async def search_excel_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query_text = update.message.text.strip()
+async def invoice_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    data = context.user_data['inv_data']
+    doc_number = get_next_doc_number()
+    date_str, _, _ = get_thai_dates()
     
-    if query_text == "➕ บันทึกข้อมูลลูกค้า":
-        return await start_add(update, context)
-    elif query_text == "📋 แสดงรายชื่อทั้งหมด":
-        return await show_all_customers(update, context)
-    elif query_text == "📁 โหลดไฟล์ Excel ทั้งหมด":
-        return await export_excel_file(update, context)
-    elif query_text in ["📖 คู่มือการใช้งาน", "คู่มือ"]:
-        return await help_command(update, context)
-
+    total_val = data['qty'] * data['price_per_unit'] * 1.07
     try:
-        df = fetch_all_from_airtable()
-        if df.empty:
-            await update.message.reply_text("⚠️ ยังไม่มีข้อมูลในระบบ Airtable", reply_markup=main_menu_markup)
-            return
-
-        total_records = len(df)
-        mask = df.astype(str).apply(
-            lambda x: x.str.contains(query_text, regex=False, case=False, na=False)
-        ).any(axis=1)
-        matched_df = df[mask]
-
-        if not matched_df.empty:
-            await update.message.reply_text(
-                f"🔍 **ผลการค้นหาจาก Airtable สำหรับ:** `{query_text}`\n"
-                f"📊 พบ {len(matched_df)} รายการ (จากทั้งหมด {total_records} รายการ)",
-                reply_markup=main_menu_markup
-            )
-
-            for idx, row in matched_df.head(5).iterrows():
-                info_text = (
-                    f"📌 **ข้อมูลลำดับที่ {idx + 1} จากทั้งหมด {total_records} รายการ**\n"
-                    f"📅 **บันทึกเมื่อ:** {row['วันเวลา']}\n"
-                    f"👤 **ชื่อ:** {row['ชื่อ']}\n"
-                    f"📍 **ที่อยู่:** {row['ที่อยู่']}\n"
-                    f"📞 **เบอร์โทร:** {row['เบอร์โทร']}\n"
-                    f"🏢 **เลขผู้เสียภาษี:** {row['เลขผู้เสียภาษี']}\n"
-                    f"📝 **หมายเหตุ:** {row['หมายเหตุ']}\n"
-                    "----------------------------------------"
-                )
-                await update.message.reply_text(info_text)
-
-                photos_str = row['รูปถ่าย']
-                if photos_str and photos_str != "-":
-                    photo_urls = [p.strip() for p in photos_str.split(',') if p.strip() and p.strip().startswith("http")]
-                    media_group = [InputMediaPhoto(media=u) for u in photo_urls]
-                    if media_group:
-                        try:
-                            await update.message.reply_media_group(media=media_group)
-                        except Exception as e:
-                            await update.message.reply_text(f"⚠️ ไม่สามารถดึงรูปภาพได้: {str(e)}")
-
-            if len(matched_df) > 5:
-                await update.message.reply_text(f"*(แสดง 5 รายการแรก จากทั้งหมดที่พบ {len(matched_df)} รายการ)*", reply_markup=main_menu_markup)
+        val = float(text)
+        if val <= 100 and "." not in text:
+            paid_amt = total_val * (val / 100)
+            pct = int(val)
         else:
-            await update.message.reply_text(f"❌ ไม่พบข้อมูลที่ตรงกับ `{query_text}` ใน Airtable", reply_markup=main_menu_markup)
+            paid_amt = val
+            pct = round((paid_amt / total_val) * 100)
+        remark_text = f"**ลูกค้าชำระยอด {pct}% จากยอดเต็มเป็นจำนวนเงิน {paid_amt:,.2f} บาท**"
+    except:
+        paid_amt = total_val * 0.60
+        remark_text = "**ลูกค้าชำระยอด 60% จากยอดเต็ม**"
 
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ เกิดข้อผิดพลาด: {str(e)}", reply_markup=main_menu_markup)
+    wb = openpyxl.load_workbook("บริษัท วินเนอร์ เชียงราย จำกัด.xlsx")
+    ws = wb['อินวอย(ช)']
+    ws['B12'] = data['customer_name']
+    ws['C13'] = data['address_line1']
+    ws['C14'] = data['address_line2']
+    ws['D15'] = data['tax_id']
+    ws['D16'] = data['phone']
+
+    ws['I13'] = doc_number
+    ws['I14'] = date_str
+    ws['C20'] = data['item_name']
+    ws['G20'] = data['qty']
+    ws['H20'] = data['price_per_unit']
+    ws['B29'] = remark_text
+    ws['J36'] = paid_amt
+
+    temp_excel = f"temp_inv_{doc_number}.xlsx"
+    wb.save(temp_excel)
+    
+    await update.message.reply_text("⏳ กำลังสร้างไฟล์ PDF และรูปภาพ...")
+    pdf_file, img_file = convert_single_sheet_to_pdf_and_image(temp_excel, 'อินวอย(ช)', doc_number)
+    if os.path.exists(temp_excel): os.remove(temp_excel)
+
+    context.bot_data[f"pdf_{doc_number}"] = pdf_file
+    context.bot_data[f"img_{doc_number}"] = img_file
+
+    file_select_keyboard = [
+        [
+            InlineKeyboardButton("📄 รับไฟล์ PDF", callback_data=f"getpdf_{doc_number}"),
+            InlineKeyboardButton("🖼️ รับเป็นรูปภาพ", callback_data=f"getimg_{doc_number}")
+        ]
+    ]
+    await update.message.reply_text(
+        f"✅ **สร้างใบอินวอยสำเร็จ!** (เลขที่: `{doc_number}`)\nเลือกรูปแบบไฟล์ที่ต้องการด้านล่าง:{status_line(doc_number)}",
+        reply_markup=InlineKeyboardMarkup(file_select_keyboard)
+    )
+    return ConversationHandler.END
+
+
+# =========================================================
+# 3. ออกใบเสร็จรับเงิน (Receipt)
+# =========================================================
+REC_SELECT, REC_VAL = range(2)
+
+async def start_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = load_db()
+    docs = db.get("documents", [])[-5:]
+
+    if not docs:
+        await update.message.reply_text("⚠️ ยังไม่มีประวัติเอกสาร กรุณาออกใบเสนอราคาก่อนครับ", reply_markup=main_menu_markup)
+        return ConversationHandler.END
+
+    keyboard = []
+    for i, doc in enumerate(docs):
+        keyboard.append([InlineKeyboardButton(f"📁 {doc.get('customer_name')} ({doc.get('doc_number')})", callback_data=f"sel_rec_{i}")])
+    
+    context.user_data['available_docs'] = docs
+    await update.message.reply_text(
+        "🧾 **ออกใบเสร็จรับเงิน**\nเลือกรายชื่อจากประวัติเพื่อดึงข้อมูลมาออกใบเสร็จ:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return REC_SELECT
+
+async def receipt_doc_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    idx = int(query.data.split("_")[-1])
+    doc = context.user_data['available_docs'][idx]
+    context.user_data['rec_data'] = doc
+
+    await query.message.reply_text(
+        f"✅ ดึงข้อมูลของ: **{doc['customer_name']}** เรียบร้อย\n\n"
+        "พิมพ์ยอดชำระเงินที่รับจริง (เช่นพิมพ์ `50000` บาท หรือพิมพ์ % เช่น `100`):"
+    )
+    return REC_VAL
+
+async def receipt_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    data = context.user_data['rec_data']
+    doc_number = get_next_doc_number()
+    date_str, due_str, _ = get_thai_dates()
+    
+    total_val = data['qty'] * data['price_per_unit'] * 1.07
+    try:
+        val = float(text)
+        if val <= 100 and "." not in text:
+            paid_amt = total_val * (val / 100)
+            pct = int(val)
+        else:
+            paid_amt = val
+            pct = round((paid_amt / total_val) * 100)
+        remark_text = f"**ลูกค้าชำระยอด {pct}% จากยอดเต็มเป็นจำนวนเงิน {paid_amt:,.2f} บาท**"
+    except:
+        paid_amt = total_val
+        pct = 100
+        remark_text = "**ลูกค้าชำระยอดเต็ม 100%**"
+
+    wb = openpyxl.load_workbook("บริษัท วินเนอร์ เชียงราย จำกัด.xlsx")
+    ws = wb['รับเงิน']
+    ws['C10'] = data['customer_name']
+    ws['D11'] = data['address_line1']
+    ws['D12'] = data['address_line2']
+    ws['E13'] = data['tax_id']
+    ws['G9'] = data['phone']
+
+    ws['I10'] = f"เลขที่          {doc_number}"
+    ws['I11'] = f"วันที่           {date_str}"
+    ws['I12'] = f"ครบกำหนด   {due_str}"
+    ws['D16'] = data['item_name']
+    ws['G16'] = data['qty']
+    ws['H16'] = data['price_per_unit']
+    ws['C30'] = remark_text
+    ws['I32'] = paid_amt
+
+    temp_excel = f"temp_rec_{doc_number}.xlsx"
+    wb.save(temp_excel)
+    
+    await update.message.reply_text("⏳ กำลังสร้างไฟล์ PDF และรูปภาพ...")
+    pdf_file, img_file = convert_single_sheet_to_pdf_and_image(temp_excel, 'รับเงิน', doc_number)
+    if os.path.exists(temp_excel): os.remove(temp_excel)
+
+    context.bot_data[f"pdf_{doc_number}"] = pdf_file
+    context.bot_data[f"img_{doc_number}"] = img_file
+
+    file_select_keyboard = [
+        [
+            InlineKeyboardButton("📄 รับไฟล์ PDF", callback_data=f"getpdf_{doc_number}"),
+            InlineKeyboardButton("🖼️ รับเป็นรูปภาพ", callback_data=f"getimg_{doc_number}")
+        ]
+    ]
+    await update.message.reply_text(
+        f"✅ **สร้างใบเสร็จรับเงินสำเร็จ!** (เลขที่: `{doc_number}`)\nเลือกรูปแบบไฟล์ที่ต้องการด้านล่าง:{status_line(doc_number)}",
+        reply_markup=InlineKeyboardMarkup(file_select_keyboard)
+    )
+    return ConversationHandler.END
+
+
+# =========================================================
+# 4. ฟังก์ชันส่งไฟล์ PDF หรือ รูปภาพ ตามปุ่มที่กดเลือก
+# =========================================================
+async def handle_file_selection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data.startswith("getpdf_"):
+        doc_num = data.replace("getpdf_", "")
+        pdf_file = context.bot_data.get(f"pdf_{doc_num}")
+        if pdf_file and os.path.exists(pdf_file):
+            with open(pdf_file, 'rb') as f:
+                await query.message.reply_document(document=f, caption=f"📄 ไฟล์ PDF เอกสารเลขที่ {doc_num}", reply_markup=main_menu_markup)
+        else:
+            err = CONVERT_ERRORS.get(doc_num, "ไม่ทราบสาเหตุ")
+            await query.message.reply_text(f"⚠️ ไม่พบไฟล์ PDF\nสาเหตุ: {err}", reply_markup=main_menu_markup)
+
+    elif data.startswith("getimg_"):
+        doc_num = data.replace("getimg_", "")
+        img_file = context.bot_data.get(f"img_{doc_num}")
+        if img_file and os.path.exists(img_file):
+            with open(img_file, 'rb') as f:
+                await query.message.reply_photo(photo=f, caption=f"🖼️ รูปภาพเอกสารเลขที่ {doc_num}", reply_markup=main_menu_markup)
+        else:
+            err = CONVERT_ERRORS.get(doc_num, "ไม่ทราบสาเหตุ")
+            await query.message.reply_text(f"⚠️ ไม่พบไฟล์รูปภาพ\nสาเหตุ: {err}", reply_markup=main_menu_markup)
+
+# =========================================================
+# 5. รายชื่อลูกค้า และ คู่มือการใช้งาน
+# =========================================================
+async def show_customers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = load_db()
+    customers = db.get("customers", [])
+    if not customers:
+        await update.message.reply_text("⚠️ ยังไม่มีรายชื่อลูกค้าในระบบ", reply_markup=main_menu_markup)
+        return
+    msg = f"📋 **รายชื่อลูกค้าทั้งหมด ({len(customers)} ราย):**\n\n"
+    for idx, c in enumerate(customers, 1):
+        msg += f"{idx}. **{c['customer_name']}**\n   📍 {c['address_line1']} {c['address_line2']}\n   🆔 เลขภาษี: {c['tax_id']} | 📞 โทร: {c['phone']}\n\n"
+    await update.message.reply_text(msg, reply_markup=main_menu_markup)
+
+async def show_guide(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    guide_text = (
+        "📖 **คู่มือการใช้งานระบบออกเอกสาร**\n\n"
+        "1️⃣ **เลือกเอกสาร:** สร้างใบเสนอราคา / อินวอย / ใบเสร็จ\n"
+        "2️⃣ **เลือรูปแบบไฟล์:** หลังจากสร้างเสร็จจะมีปุ่มให้กดเลือกว่าจะรับเป็น **PDF** หรือ **รูปภาพ (PNG)**\n"
+        "3️⃣ **ไร้ขอบขาว 100%:** เอกสารทุกไฟล์ถูกปรับขนาดพอดีขอบกระดาษเรียบร้อย\n"
+        "💬 พิมพ์ /start เพื่อรีเซ็ตเมนูหลักได้ตลอดเวลาครับ"
+    )
+    await update.message.reply_text(guide_text, reply_markup=main_menu_markup)
+
+async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔍 กำลังตรวจสอบระบบ (อาจใช้เวลา 5-10 วินาที)...")
+    lines = diagnose_environment()
+    await update.message.reply_text("\n".join(lines), reply_markup=main_menu_markup)
+
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 **ยินดีต้อนรับสู่บอทบันทึกและค้นหาข้อมูลลูกค้า!**\n\n"
-        "✨ ระบบดึงและซิงก์ข้อมูลตรงจาก Airtable 100% มั่นใจได้ว่าข้อมูลถูกต้องแม่นยำและปลอดภัยไร้กังวล",
+        f"🤖 **ระบบออกเอกสาร Winner Chiangrai** ({BOT_VERSION})\nเลือกเมนูด้านล่างเพื่อเริ่มใช้งานได้เลยครับ:",
         reply_markup=main_menu_markup
     )
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📖 **คู่มือการใช้งานบอท:**\n\n"
-        "1. **บันทึกข้อมูล**: กดปุ่ม **'➕ บันทึกข้อมูลลูกค้า'** (เช็กข้อมูลซ้ำและบันทึกตรงเข้า Airtable ทันที)\n"
-        "2. **ดาวน์โหลดไฟล์ Excel**: กดปุ่ม **'📁 โหลดไฟล์ Excel ทั้งหมด'** เพื่อดึงข้อมูลสดๆ จาก Airtable มาสร้างไฟล์รายงาน\n"
-        "3. **แสดงรายชื่อและค้นหา**: ข้อมูลทั้งหมดดึงจาก Airtable แบบ Real-time 100%",
-        reply_markup=main_menu_markup
-    )
+async def cancel_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("❌ ยกเลิกรายการเรียบร้อย", reply_markup=main_menu_markup)
+    return ConversationHandler.END
 
 # ---------------------------------------------------------
-# ระบบ Flask Web Server จำลองสำหรับ Render Web Service
+# Main App
 # ---------------------------------------------------------
 web_app = Flask('')
-
 @web_app.route('/')
 def home():
-    return "Telegram Bot is running 24/7 successfully!"
+    return "Bot is running locally!"
 
 def run_web():
-    port = int(os.environ.get("PORT", 8080))
-    web_app.run(host='0.0.0.0', port=port)
+    web_app.run(host='0.0.0.0', port=8080)
 
 if __name__ == "__main__":
-    # รัน Web Server บน Thread แยก เพื่อป้องกัน Port Scan Timeout บน Render
+    init_db()
+    if fitz is None:
+        print("⚠️ ยังไม่ได้ติดตั้ง PyMuPDF — ปุ่ม 'รับเป็นรูปภาพ' อาจใช้ไม่ได้  รันคำสั่ง: pip install pymupdf")
     threading.Thread(target=run_web, daemon=True).start()
     
     request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).request(request).build()
     
-    conv_handler = ConversationHandler(
-        entry_points=[
-            CommandHandler("add", start_add),
-            MessageHandler(filters.Regex(r"^(/บันทึก|บันทึก|➕ บันทึกข้อมูลลูกค้า)$"), start_add)
-        ],
+    quot_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^(📄 ออกใบเสนอราคา|ออกใบเสนอราคา)$"), start_quotation)],
         states={
-            NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_name)],
-            ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_address)],
-            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_phone)],
-            TAX_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_tax_id)],
-            REMARKS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_remarks)],
-            PHOTOS: [
-                MessageHandler(filters.PHOTO, receive_photos),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_photos)
-            ],
+            QUOT_FORM: [CallbackQueryHandler(handle_quotation_callback)],
+            INPUT_FIELD: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_quotation_input)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)]
+        fallbacks=[CommandHandler("cancel", cancel_process)]
+    )
+
+    inv_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^(📑 ออกอินวอย \(Invoice\)|ออกอินวอย)$"), start_invoice)],
+        states={
+            INV_SELECT: [CallbackQueryHandler(invoice_doc_selected, pattern="^sel_inv_")],
+            INV_VAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, invoice_generate)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_process)]
+    )
+
+    rec_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^(🧾 ออกใบเสร็จรับเงิน|ออกใบเสร็จรับเงิน)$"), start_receipt)],
+        states={
+            REC_SELECT: [CallbackQueryHandler(receipt_doc_selected, pattern="^sel_rec_")],
+            REC_VAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, receipt_generate)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_process)]
     )
 
     app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(conv_handler)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_excel_data))
+    app.add_handler(CommandHandler("check", check_command))
+    app.add_handler(MessageHandler(filters.Regex(r"^(📋 รายชื่อลูกค้าที่บันทึกไว้)$"), show_customers))
+    app.add_handler(MessageHandler(filters.Regex(r"^(📖 คู่มือการใช้งาน)$"), show_guide))
     
-    print("🤖 Telegram Bot พร้อมเว็บเซิร์ฟเวอร์จำลองเชื่อมต่อ Airtable 100% ทำงานแล้ว...")
+    # ✅ เพิ่มส่วนนี้เข้ามาเพื่อดักจับรูปภาพที่ผู้ใช้ส่งเข้ามา ป้องกันข้อผิดพลาด "อัปโหลดรูปไม่สำเร็จ"
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo_upload))
+    
+    app.add_handler(quot_handler)
+    app.add_handler(inv_handler)
+    app.add_handler(rec_handler)
+    app.add_handler(CallbackQueryHandler(handle_file_selection_callback, pattern="^(getpdf_|getimg_)"))
+    
+    print(f"เวอร์ชันบอท: {BOT_VERSION}")
+    print("🤖 บอทพร้อมทำงานแล้ว...")
     app.run_polling()
