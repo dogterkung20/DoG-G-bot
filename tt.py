@@ -20,7 +20,7 @@ from telegram.ext import (
 from telegram.request import HTTPXRequest
 
 # ==========================================
-# 🔑 ค่าความปลอดภัย (บังคับดึงจาก Environment Variables เท่านั้น)
+# 🔑 ค่าความปลอดภัย (ดึงจาก Environment Variables)
 # ==========================================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 AIRTABLE_TOKEN = os.environ.get("AIRTABLE_TOKEN")
@@ -53,19 +53,21 @@ def save_db(data):
 # 📊 ฟังก์ชันเชื่อมต่อและบันทึกข้อมูลลง Airtable
 # ==========================================
 def save_or_update_customer_airtable(cust_data):
-    """บันทึกหรืออัปเดตข้อมูลลูกค้าไปยัง Airtable แบบ Real-time"""
+    """บันทึกข้อมูลลูกค้าไปยัง Airtable แบบ Real-time"""
     url = f"https://api.airtable.com/v0/{BASE_ID}/{TABLE_NAME}"
     headers = {
         "Authorization": f"Bearer {AIRTABLE_TOKEN}",
         "Content-Type": "application/json"
     }
     
+    # จับคู่ฟิลด์ให้ตรงกับตารางใน Airtable ของคุณ
     payload = {
         "fields": {
+            "วันเวลา": datetime.now().strftime("%d ม.ค. %Y เวลา %H:%M น."),
             "ชื่อ": cust_data.get("customer_name"),
             "ที่อยู่": f"{cust_data.get('address_line1', '')} {cust_data.get('address_line2', '')}".strip(),
-            "เบอร์โทร": cust_data.get("phone"),
-            "เลขผู้เสียภาษี": cust_data.get("tax_id"),
+            "เบอร์โทร": str(cust_data.get("phone", "")),
+            "เลขผู้เสียภาษี": str(cust_data.get("tax_id", "")),
             "หมายเหตุ": cust_data.get("remarks", "-")
         }
     }
@@ -79,6 +81,7 @@ def save_or_update_customer_airtable(cust_data):
     except Exception as e:
         print(f"❌ Connection Error (Airtable): {e}")
 
+    # สำรองเก็บบันทึกลง local database ไว้ด้วย
     db = load_db()
     customers = db.get("customers", [])
     customers.append(cust_data)
@@ -170,7 +173,7 @@ def make_borderless_pdf_and_png(raw_pdf, final_pdf, final_png, png_dpi=200):
     pil_img.save(final_png, "PNG")
 
 
-BOT_VERSION = "v4-airtable-secure"
+BOT_VERSION = "v4-airtable-realtime"
 CONVERT_STATUS = {}
 
 def status_line(doc_number):
@@ -717,24 +720,51 @@ async def handle_file_selection_callback(update: Update, context: ContextTypes.D
             await query.message.reply_text(f"⚠️ ไม่พบไฟล์รูปภาพ\nสาเหตุ: {err}", reply_markup=main_menu_markup)
 
 # =========================================================
-# 5. รายชื่อลูกค้า และ คู่มือการใช้งาน
+# 5. รายชื่อลูกค้า (ดึงสดจาก Airtable 100%) และ คู่มือการใช้งาน
 # =========================================================
 async def show_customers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    db = load_db()
-    customers = db.get("customers", [])
-    if not customers:
-        await update.message.reply_text("⚠️ ยังไม่มีรายชื่อลูกค้าในระบบ", reply_markup=main_menu_markup)
-        return
-    msg = f"📋 **รายชื่อลูกค้าทั้งหมด ({len(customers)} ราย):**\n\n"
-    for idx, c in enumerate(customers, 1):
-        msg += f"{idx}. **{c['customer_name']}**\n   📍 {c['address_line1']} {c['address_line2']}\n   🆔 เลขภาษี: {c['tax_id']} | 📞 โทร: {c['phone']}\n\n"
-    await update.message.reply_text(msg, reply_markup=main_menu_markup)
+    url = f"https://api.airtable.com/v0/{BASE_ID}/{TABLE_NAME}"
+    headers = {
+        "Authorization": f"Bearer {AIRTABLE_TOKEN}"
+    }
+    
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            records = response.json().get("records", [])
+            if not records:
+                await update.message.reply_text("⚠️ ยังไม่มีรายชื่อลูกค้าใน Airtable", reply_markup=main_menu_markup)
+                return
+            
+            msg = f"📋 **รายชื่อลูกค้าทั้งหมดใน Airtable ({len(records)} รายการ):**\n\n"
+            for idx, record in enumerate(records, 1):
+                fields = record.get("fields", {})
+                name = fields.get("ชื่อ", "-")
+                addr = fields.get("ที่อยู่", "-")
+                phone = fields.get("เบอร์โทร", "-")
+                tax = fields.get("เลขผู้เสียภาษี", "-")
+                date_time = fields.get("วันเวลา", "-")
+                remarks = fields.get("หมายเหตุ", "-")
+                
+                msg += f"🔹 **ลำดับที่ {idx}:** {name}\n"
+                msg += f"   📅 วันที่: {date_time}\n"
+                msg += f"   📍 ที่อยู่: {addr}\n"
+                msg += f"   📞 โทร: {phone} | 🆔 เลขภาษี: {tax}\n"
+                msg += f"   📝 หมายเหตุ: {remarks}\n"
+                msg += "----------------------------------------\n"
+            
+            await update.message.reply_text(msg, reply_markup=main_menu_markup)
+        else:
+            await update.message.reply_text(f"⚠️ ดึงข้อมูลจาก Airtable ไม่สำเร็จ (Error: {response.status_code})", reply_markup=main_menu_markup)
+    except Exception as e:
+        print(f"Airtable Fetch Error: {e}")
+        await update.message.reply_text("❌ เกิดข้อผิดพลาดในการเชื่อมต่อ Airtable", reply_markup=main_menu_markup)
 
 async def show_guide(update: Update, context: ContextTypes.DEFAULT_TYPE):
     guide_text = (
         "📖 **คู่มือการใช้งานระบบออกเอกสาร**\n\n"
         "1️⃣ **เลือกเอกสาร:** สร้างใบเสนอราคา / อินวอย / ใบเสร็จ\n"
-        "2️⃣ **เลือรูปแบบไฟล์:** หลังจากสร้างเสร็จจะมีปุ่มให้กดเลือกว่าจะรับเป็น **PDF** หรือ **รูปภาพ (PNG)**\n"
+        "2️⃣ **เลือกรูปแบบไฟล์:** หลังจากสร้างเสร็จจะมีปุ่มให้กดเลือกว่าจะรับเป็น **PDF** หรือ **รูปภาพ (PNG)**\n"
         "3️⃣ **ไร้ขอบขาว 100%:** เอกสารทุกไฟล์ถูกปรับขนาดพอดีขอบกระดาษเรียบร้อย\n"
         "💬 พิมพ์ /start เพื่อรีเซ็ตเมนูหลักได้ตลอดเวลาครับ"
     )
@@ -815,5 +845,5 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(handle_file_selection_callback, pattern="^(getpdf_|getimg_)"))
     
     print(f"เวอร์ชันบอท: {BOT_VERSION}")
-    print("🤖 บอทพร้อมทำงานแล้ว...")
+    print("🤖 บอทพร้อมทำงานดึงข้อมูลจาก Airtable 100% แล้ว...")
     app.run_polling()
