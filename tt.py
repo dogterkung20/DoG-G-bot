@@ -3,6 +3,7 @@ import re
 import json
 import threading
 from datetime import datetime, timedelta
+import requests
 import openpyxl
 from flask import Flask
 from PIL import Image, ImageChops
@@ -19,9 +20,18 @@ from telegram.ext import (
 from telegram.request import HTTPXRequest
 
 # ==========================================
-# 🔑 Token บอท Telegram
+# 🔑 ค่าความปลอดภัย (บังคับดึงจาก Environment Variables เท่านั้น)
 # ==========================================
-TELEGRAM_BOT_TOKEN = "8863260350:AAECdIo15nDl0kxPR6tCnBys9opMExapTY4"
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+AIRTABLE_TOKEN = os.environ.get("AIRTABLE_TOKEN")
+BASE_ID = os.environ.get("BASE_ID")
+TABLE_NAME = os.environ.get("TABLE_NAME")
+
+if not TELEGRAM_BOT_TOKEN:
+    raise ValueError("❌ ไม่พบ TELEGRAM_BOT_TOKEN กรุณาตั้งค่า Environment Variable บนระบบ")
+if not AIRTABLE_TOKEN or not BASE_ID or not TABLE_NAME:
+    raise ValueError("❌ ไม่พบค่ากำหนด Airtable (AIRTABLE_TOKEN, BASE_ID, TABLE_NAME) กรุณาตั้งค่าบนระบบ")
+
 DB_FILE = "local_database.json"
 
 def init_db():
@@ -39,21 +49,39 @@ def save_db(data):
     with open(DB_FILE, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
 
-def save_or_update_customer(cust_data):
+# ==========================================
+# 📊 ฟังก์ชันเชื่อมต่อและบันทึกข้อมูลลง Airtable
+# ==========================================
+def save_or_update_customer_airtable(cust_data):
+    """บันทึกหรืออัปเดตข้อมูลลูกค้าไปยัง Airtable แบบ Real-time"""
+    url = f"https://api.airtable.com/v0/{BASE_ID}/{TABLE_NAME}"
+    headers = {
+        "Authorization": f"Bearer {AIRTABLE_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    
+    payload = {
+        "fields": {
+            "ชื่อ": cust_data.get("customer_name"),
+            "ที่อยู่": f"{cust_data.get('address_line1', '')} {cust_data.get('address_line2', '')}".strip(),
+            "เบอร์โทร": cust_data.get("phone"),
+            "เลขผู้เสียภาษี": cust_data.get("tax_id"),
+            "หมายเหตุ": cust_data.get("remarks", "-")
+        }
+    }
+    
+    try:
+        response = requests.post(url, json=payload, headers=headers)
+        if response.status_code in [200, 201]:
+            print("✅ บันทึกข้อมูลลง Airtable สำเร็จ")
+        else:
+            print(f"⚠️ Airtable Error: {response.text}")
+    except Exception as e:
+        print(f"❌ Connection Error (Airtable): {e}")
+
     db = load_db()
     customers = db.get("customers", [])
-    existing_index = -1
-    for idx, c in enumerate(customers):
-        if (c.get("customer_name") and c.get("customer_name").strip() == cust_data.get("customer_name", "").strip()) or \
-           (c.get("tax_id") and c.get("tax_id") != "-" and c.get("tax_id") == cust_data.get("tax_id")):
-            existing_index = idx
-            break
-
-    if existing_index >= 0:
-        customers[existing_index].update(cust_data)
-    else:
-        customers.append(cust_data)
-
+    customers.append(cust_data)
     db["customers"] = customers
     save_db(db)
 
@@ -142,7 +170,7 @@ def make_borderless_pdf_and_png(raw_pdf, final_pdf, final_png, png_dpi=200):
     pil_img.save(final_png, "PNG")
 
 
-BOT_VERSION = "v4-borderless-check-fixed"
+BOT_VERSION = "v4-airtable-secure"
 CONVERT_STATUS = {}
 
 def status_line(doc_number):
@@ -384,9 +412,10 @@ async def handle_quotation_callback(update: Update, context: ContextTypes.DEFAUL
             "address_line1": data['address_line1'],
             "address_line2": data['address_line2'],
             "tax_id": data['tax_id'],
-            "phone": data['phone']
+            "phone": data['phone'],
+            "remarks": data['remarks']
         }
-        save_or_update_customer(cust_info)
+        save_or_update_customer_airtable(cust_info)
 
         db = load_db()
         db["documents"].append({**data, "doc_number": doc_number, "date_iso": date_iso, "type": "quotation"})
@@ -779,10 +808,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("check", check_command))
     app.add_handler(MessageHandler(filters.Regex(r"^(📋 รายชื่อลูกค้าที่บันทึกไว้)$"), show_customers))
     app.add_handler(MessageHandler(filters.Regex(r"^(📖 คู่มือการใช้งาน)$"), show_guide))
-    
-    # ✅ เพิ่มส่วนนี้เข้ามาเพื่อดักจับรูปภาพที่ผู้ใช้ส่งเข้ามา ป้องกันข้อผิดพลาด "อัปโหลดรูปไม่สำเร็จ"
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_upload))
-    
     app.add_handler(quot_handler)
     app.add_handler(inv_handler)
     app.add_handler(rec_handler)
